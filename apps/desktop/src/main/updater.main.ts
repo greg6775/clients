@@ -1,8 +1,9 @@
 import { dialog, shell } from "electron";
 import log from "electron-log";
-import { autoUpdater } from "electron-updater";
+import { autoUpdater, VerifyUpdateSupport } from "electron-updater";
 
 import { I18nService } from "@bitwarden/common/platform/abstractions/i18n.service";
+import { LogService } from "@bitwarden/common/platform/abstractions/log.service";
 
 import { isAppImage, isDev, isMacAppStore, isWindowsPortable, isWindowsStore } from "../utils";
 
@@ -15,12 +16,16 @@ export class UpdaterMain {
   private doingUpdateCheck = false;
   private doingUpdateCheckWithFeedback = false;
   private canUpdate = false;
+  private originalRolloutFunction: VerifyUpdateSupport;
 
   constructor(
     private i18nService: I18nService,
+    private logService: LogService,
     private windowMain: WindowMain,
   ) {
     autoUpdater.logger = log;
+
+    this.originalRolloutFunction = autoUpdater.isUserWithinRollout;
 
     const linuxCanUpdate = process.platform === "linux" && isAppImage();
     const windowsCanUpdate =
@@ -35,10 +40,15 @@ export class UpdaterMain {
     global.setInterval(async () => await this.checkForUpdate(), UpdaterCheckInterval);
 
     autoUpdater.on("checking-for-update", () => {
+      this.logService.debug("[Updater] Checking for update...");
       this.doingUpdateCheck = true;
     });
 
     autoUpdater.on("update-available", async () => {
+      this.logService.debug(
+        `[Updater] Update available (with feedback: ${this.doingUpdateCheckWithFeedback})`,
+      );
+
       if (this.doingUpdateCheckWithFeedback) {
         if (this.windowMain.win == null) {
           this.reset();
@@ -57,20 +67,18 @@ export class UpdaterMain {
         });
 
         if (result.response === 0) {
-          // FIXME: Verify that this floating promise is intentional. If it is, add an explanatory comment and ensure there is proper error handling.
-          // eslint-disable-next-line @typescript-eslint/no-floating-promises
-          autoUpdater.downloadUpdate();
+          await autoUpdater.downloadUpdate();
         } else {
           this.reset();
         }
       }
     });
 
-    autoUpdater.on("update-not-available", () => {
+    autoUpdater.on("update-not-available", async () => {
+      this.logService.debug("[Updater] No update available");
+
       if (this.doingUpdateCheckWithFeedback && this.windowMain.win != null) {
-        // FIXME: Verify that this floating promise is intentional. If it is, add an explanatory comment and ensure there is proper error handling.
-        // eslint-disable-next-line @typescript-eslint/no-floating-promises
-        dialog.showMessageBox(this.windowMain.win, {
+        await dialog.showMessageBox(this.windowMain.win, {
           message: this.i18nService.t("noUpdatesAvailable"),
           buttons: [this.i18nService.t("ok")],
           defaultId: 0,
@@ -82,6 +90,8 @@ export class UpdaterMain {
     });
 
     autoUpdater.on("update-downloaded", async (info) => {
+      this.logService.debug("[Updater] Update downloaded");
+
       if (this.windowMain.win == null) {
         return;
       }
@@ -105,6 +115,8 @@ export class UpdaterMain {
     });
 
     autoUpdater.on("error", (error) => {
+      this.logService.error("[Updater] Error in auto-updater", error);
+
       if (this.doingUpdateCheckWithFeedback) {
         dialog.showErrorBox(
           this.i18nService.t("updateError"),
@@ -123,9 +135,7 @@ export class UpdaterMain {
 
     if (!this.canUpdate) {
       if (withFeedback) {
-        // FIXME: Verify that this floating promise is intentional. If it is, add an explanatory comment and ensure there is proper error handling.
-        // eslint-disable-next-line @typescript-eslint/no-floating-promises
-        shell.openExternal("https://github.com/bitwarden/clients/releases");
+        void shell.openExternal("https://github.com/bitwarden/clients/releases");
       }
 
       return;
@@ -134,6 +144,10 @@ export class UpdaterMain {
     this.doingUpdateCheckWithFeedback = withFeedback;
     if (withFeedback) {
       autoUpdater.autoDownload = false;
+
+      // If the user has explicitly checked for updates, we want to bypass
+      // the current staging rollout percentage
+      autoUpdater.isUserWithinRollout = (info) => true;
     }
 
     await autoUpdater.checkForUpdates();
@@ -141,6 +155,8 @@ export class UpdaterMain {
 
   private reset() {
     autoUpdater.autoDownload = true;
+    // Reset the rollout check to the default behavior
+    autoUpdater.isUserWithinRollout = this.originalRolloutFunction;
     this.doingUpdateCheck = false;
   }
 
